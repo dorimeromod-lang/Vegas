@@ -1,0 +1,36 @@
+# Секреты и локальные настройки
+firmware/include/secrets.h
+server/.env
+*.env
+!*.env.example
+
+# PlatformIO
+.pio/
+firmware/.pio/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# Модели, голоса и кэш TTS (качаются отдельно)
+server/models/
+server/piper/
+server/tts_cache/
+*.onnx
+*.onnx.json
+
+# Аудио и прошивки
+*.wav
+*.bin
+*.elf
+*.map
+
+# Бэкапы
+backups/
+
+# ОС
+.DS_Store
+Thumbs.db

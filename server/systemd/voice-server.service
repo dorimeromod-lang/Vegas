@@ -1,0 +1,19 @@
+[Unit]
+Description=Vegas voice assistant server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vegas
+Group=vegas
+WorkingDirectory=/opt/vegas-voice-assistant/server
+EnvironmentFile=/opt/vegas-voice-assistant/server/.env
+ExecStart=/opt/vegas-voice-assistant/server/venv/bin/python voice_server.py
+Restart=on-failure
+RestartSec=5
+# Модели грузятся долго — не убиваем процесс при старте
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
