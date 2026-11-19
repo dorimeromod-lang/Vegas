@@ -23,7 +23,7 @@
 #include "esp_sleep.h"
 #include "config.h"
 
-#define FW_VERSION "3.5.7"
+#define FW_VERSION "3.5.9"
 
 // ------------------------------------------------------------
 //  Константы и состояние
@@ -153,6 +153,7 @@ static void ledUpdate() {
 
 static bool micRunning = false;
 static bool speechStarted = false;
+static bool followUpMode = false;
 static uint32_t recordStart = 0;
 static uint32_t speechStartAt = 0;
 static uint32_t lastVoiceAt = 0;
@@ -160,6 +161,8 @@ static uint32_t quietSince = 0;
 static bool quietActive = false;
 static float smoothRms = 0;
 static float noiseFloor = 0;
+static uint32_t noiseSum = 0;
+static uint32_t noiseCount = 0;
 static uint32_t lastRmsLog = 0;
 
 static bool audioDone = false;
@@ -461,14 +464,30 @@ static void setState(State s) {
     stateSince = millis();
 }
 
+static void cleanupAfterConversation() {
+    // Освобождаем память после каждого разговора
+    netLogBuf = "";
+    netLogBuf.reserve(0);
+    cmdPrerollCount = 0;
+    cmdPrerollWrite = 0;
+    speechStarted = false;
+    quietActive = false;
+    quietSince = 0;
+    smoothRms = 0.0f;
+    noiseFloor = 0.0f;
+    speechStartAt = 0;
+}
+
 static void enterIdle(const char *reason) {
     micStop();
     if (state == ST_SPEAKING || state == ST_THINKING) {
         i2s_zero_dma_buffer(I2S_SPK_PORT);
         audioDone = false;
     }
+    followUpMode = false;
     setState(ST_IDLE);
     if (reason && *reason) Serial.printf("[Состояние] idle (%s)\n", reason);
+    cleanupAfterConversation();
 }
 
 static void stopSpeakingNow() {
@@ -535,6 +554,7 @@ static void flushCmdPreroll() {
 
 static void startListening() {
     markActivity();
+    followUpMode = false;
 
     if (WiFi.status() != WL_CONNECTED || !wsClient.isConnected()) {
         netLog("[Запись] Нет соединения с сервером.\n");
@@ -559,6 +579,8 @@ static void startListening() {
     quietSince = 0;
     quietActive = false;
     smoothRms = 0;
+    noiseSum = 0;
+    noiseCount = 0;
 
     recordStart = millis();
     speechStartAt = 0;
@@ -568,28 +590,73 @@ static void startListening() {
     netLog("[Запись] Старт. Говорите...\n");
 }
 
+static void startFollowUpListening() {
+    if (WiFi.status() != WL_CONNECTED || !wsClient.isConnected()) {
+        netLog("[Диалог] Нет соединения для продолжения.\n");
+        followUpMode = false;
+        enterIdle("no server");
+        return;
+    }
+    markActivity();
+
+    micStop();
+    micStart();
+    delay(30);
+    noiseFloor = measureNoiseFloor(150);
+    if (noiseFloor < 50.0f) noiseFloor = 50.0f;
+
+    cmdPrerollCount = 0;
+    cmdPrerollWrite = 0;
+    speechStarted = false;
+    quietSince = 0;
+    quietActive = false;
+    smoothRms = 0.0f;
+    noiseSum = 0;
+    noiseCount = 0;
+    speechStartAt = 0;
+
+    recordStart = millis();
+    lastVoiceAt = recordStart;
+    lastRmsLog = recordStart;
+    followUpMode = true;
+    setState(ST_LISTENING);
+    netLog("[Диалог] Слушаю продолжение (%u мс, шум=%d)...\n",
+           (unsigned)FOLLOWUP_LISTEN_TIMEOUT_MS, (int)noiseFloor);
+}
+
 static void finishListening(bool sendToServer) {
     micStop();
     markActivity();
 
+    bool wasFollowUp = followUpMode;
+    followUpMode = false;
+
     if (sendToServer && wsClient.isConnected()) {
         wsClient.sendTXT("END_OF_SPEECH");
-        playTone(800, 60);         // «конец записи» — не ловится, динамик
+        if (!wasFollowUp) {
+            playTone(800, 60);         // «конец записи» в обычном режиме
+        }
         thinkingSince = millis();
         setState(ST_THINKING);
         netLog("[Запись] Отправлено, жду ответ сервера...\n");
     } else {
-        playTone(300, 100);
-        enterIdle("no speech");
+        if (wasFollowUp) {
+            netLog("[Диалог] Голоса нет, завершаю диалог.\n");
+            enterIdle("followup timeout");
+        } else {
+            playTone(300, 100);
+            enterIdle("no speech");
+        }
     }
 }
 
 static void recordStep() {
     int frames = 0;
     int rms = readMicBlock(pcmBuf, frames);
+    uint32_t startTimeout = followUpMode ? FOLLOWUP_LISTEN_TIMEOUT_MS : VAD_START_TIMEOUT;
     if (frames <= 0) {
         uint32_t now = millis();
-        if (!speechStarted && now - recordStart >= VAD_START_TIMEOUT) {
+        if (!speechStarted && now - recordStart >= startTimeout) {
             finishListening(false);
         } else if (now - recordStart >= MAX_RECORD_MS) {
             finishListening(speechStarted);
@@ -626,7 +693,7 @@ static void recordStep() {
             }
         }
 
-        if (!speechStarted && now - recordStart >= VAD_START_TIMEOUT) {
+        if (!speechStarted && now - recordStart >= startTimeout) {
             finishListening(false);
             return;
         }
@@ -715,7 +782,7 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
                     netLog("[Ответ] Конец аудио.\n");
                 } else if (state == ST_THINKING) {
                     Serial.println("[Ответ] Аудио нет, ответ только текстом.");
-                    enterIdle("no tts");
+                    startFollowUpListening();
                 }
                 break;
             }
@@ -1106,7 +1173,7 @@ void loop() {
         case ST_SPEAKING:
             if (audioDone && millis() - lastAudioAt > 500) {
                 audioDone = false;
-                enterIdle("tts done");
+                startFollowUpListening();
             }
             break;
 
