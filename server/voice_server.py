@@ -99,6 +99,32 @@ TTS_CACHE_DIR = os.environ.get(
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:0.5b")
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "2h")
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "4096"))
+# Первый ответ Ollama после загрузки модели может быть медленным (прогрев).
+OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "45"))
+
+# Отдача TTS в темпе реального времени.
+# Раньше сервер слал 1024 байта (~23 мс звука) за ~1 мс — в 23 раза быстрее
+# реального времени. DMA/кольцо на ESP забивалось, i2s_write вставал
+# намертво и устройство ловило watchdog. Теперь держим темп реального времени
+# (1.0 = как играет динамик), а запас 0.25 с гасит дрожание сети.
+TTS_STREAM_SPEED = float(os.environ.get("TTS_STREAM_SPEED", "1.0"))
+# Небольшой «запас» вперёд, чтобы на ESP не было паузы перед первым слогом.
+TTS_STREAM_LEAD = float(os.environ.get("TTS_STREAM_LEAD", "0.25"))
+
+# Память диалога: сколько символов истории держим в контексте LLM.
+# История живёт в рамках одного WebSocket-соединения и обнуляется при обрыве.
+HISTORY_MAX_CHARS = int(os.environ.get("HISTORY_MAX_CHARS", "4000"))
+# Как часто продлевать бодрствование ESP (прошивка спит через 120 с простоя).
+KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL", "45"))
+# Кому отдавать победу при близких log-prob (пользователь говорит по-русски).
+STT_PREFER_LANGUAGE = os.environ.get("STT_PREFER_LANGUAGE", "ru").strip().lower()
+# Порог уверенности, с которого модель считается победившей без споров.
+# Английской модели нужно больше уверенности: пользователь в основном говорит
+# по-русски, а английская модель на русской речи выдаёт бойкий мусор
+# («A NOT A MILE NOW» вместо «нормально»).
+STT_RU_MARGIN = float(os.environ.get("STT_RU_MARGIN", "0.10"))
+STT_EN_MARGIN = float(os.environ.get("STT_EN_MARGIN", "0.25"))
 
 # LLM_BACKEND: ollama | deepseek | auto (DeepSeek, при ошибке — Ollama)
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama").strip().lower()
@@ -770,6 +796,87 @@ def _script_ratio(text: str) -> Tuple[float, float]:
     return cyr / total, lat / total
 
 
+def _is_plausible(text: str, lang: str) -> bool:
+    """Отсекает пустое и откровенный мусор («I», «AND») от живого текста."""
+    text = text.strip()
+    if not text:
+        return False
+    alpha = [ch for ch in text if ch.isalpha()]
+    if not alpha:
+        return False
+    if lang == "ru":
+        cyr, _ = _script_ratio(text)
+        # Русская модель всегда отдаёт кириллицу — требуем её большую часть.
+        if cyr < 0.8:
+            return False
+    else:
+        _, lat = _script_ratio(text)
+        if lat < 0.8:
+            return False
+    # Одна-две буквы без цифр — почти всегда шум микрофона, а не речь.
+    if len(alpha) <= 2 and not any(ch.isdigit() for ch in text):
+        return False
+    return True
+
+
+def _choose_language(
+    ru_text: str,
+    en_text: str,
+    ru_lp: float,
+    en_lp: float,
+) -> Tuple[str, str]:
+    """Выбирает распознанный текст и язык. Возвращает (текст, режим).
+
+    Порядок решений:
+      1. только один вариант непустой — берём его;
+      2. в спорной зоне (разница log-prob мала) погодное слово решает спор;
+      3. уверенный перевес своей модели — сразу берём его;
+      4. иначе — доверяем языку пользователя, если текст выглядит живым.
+    """
+    if ru_text and not en_text:
+        return ru_text, "ru"
+    if en_text and not ru_text:
+        return en_text, "en"
+    if not ru_text and not en_text:
+        return "", "empty"
+
+    # В спорных коротких фразах погодное слово — сильный сигнал: русская
+    # модель может услышать «водит снег» там, где английская выдала мусор.
+    if abs(ru_lp - en_lp) <= 0.25:
+        ru_weather = bool(WEATHER_RE.search(normalize(ru_text)))
+        en_weather = bool(WEATHER_RE.search(normalize(en_text)))
+        if ru_weather != en_weather:
+            return (ru_text, "ru") if ru_weather else (en_text, "en")
+
+    # Уверенный перевес модели решает язык однозначно. Английской модели
+    # нужен больший отрыв: на русской речи она выдаёт бойкий мусор
+    # («A NOT A MILE NOW» вместо «нормально»), который выглядит живым.
+    if ru_lp >= en_lp + STT_RU_MARGIN:
+        return ru_text, "ru"
+    if en_lp >= ru_lp + STT_EN_MARGIN:
+        return en_text, "en"
+
+    # Спорная зона: раньше здесь выигрывал вариант «где больше слов» —
+    # именно поэтому «нормально» превращалось в «A NOT A MILE NOW».
+    # Теперь по умолчанию верим языку пользователя, если текст правдоподобен.
+    logging.info(
+        f"[STT-big] близкие log-prob (ru {ru_lp:+.2f} / en {en_lp:+.2f}) -> "
+        f"приоритет {STT_PREFER_LANGUAGE}"
+    )
+    preferred, other = (
+        ((ru_text, "ru"), (en_text, "en"))
+        if STT_PREFER_LANGUAGE != "en"
+        else ((en_text, "en"), (ru_text, "ru"))
+    )
+    if _is_plausible(preferred[0], preferred[1]):
+        return preferred
+    if _is_plausible(other[0], other[1]):
+        return other
+
+    # Оба варианта сомнительны — отдаём тот, что увереннее.
+    return (en_text, "en") if en_lp > ru_lp else (ru_text, "ru")
+
+
 def transcribe_big_bilingual_sync(
     pcm: bytes,
 ) -> Tuple[str, str, Dict[str, Any], Dict[str, float]]:
@@ -802,27 +909,8 @@ def transcribe_big_bilingual_sync(
     if not ru_text and not en_text:
         return "", "empty", info, timings
 
-    # В спорных коротких фразах погодное слово — сильный сигнал: русская
-    # модель может услышать «водит снег» там, где английская выдала мусор.
-    if abs(ru_lp - en_lp) <= 0.25:
-        ru_weather = bool(WEATHER_RE.search(normalize(ru_text)))
-        en_weather = bool(WEATHER_RE.search(normalize(en_text)))
-        if ru_weather != en_weather:
-            if ru_weather:
-                return ru_text, "ru", info, timings
-            return en_text, "en", info, timings
-
-    # Средний log-prob уверенно разделяет языки: у «своей» модели он заметно выше.
-    if ru_lp > en_lp + 0.10:
-        return ru_text, "ru", info, timings
-    if en_lp > ru_lp + 0.10:
-        return en_text, "en", info, timings
-
-    ru_cyr, _ = _script_ratio(ru_text)
-    _, en_lat = _script_ratio(en_text)
-    if ru_cyr >= en_lat and len(ru_text.split()) >= len(en_text.split()):
-        return ru_text, "ru", info, timings
-    return en_text, "en", info, timings
+    chosen_text, chosen_mode = _choose_language(ru_text, en_text, ru_lp, en_lp)
+    return chosen_text, chosen_mode, info, timings
 
 
 def _vosk_transcribe_sync(pcm: bytes) -> Tuple[str, str, Dict[str, Any], Dict[str, float]]:
@@ -1012,6 +1100,8 @@ async def send_tts(websocket: WebSocket, text: str) -> None:
     started = time.time()
     first_audio_at: Optional[float] = None
     total_bytes = 0
+    sent_seconds = 0.0
+    stream_started = 0.0
 
     next_task = loop.run_in_executor(None, synthesize_tts, parts[0])
     for index, _part in enumerate(parts):
@@ -1037,9 +1127,20 @@ async def send_tts(websocket: WebSocket, text: str) -> None:
             )
 
         total_bytes += len(audio)
+        if not stream_started:
+            stream_started = time.time()
+
         for offset in range(0, len(audio), 1024):
-            await websocket.send_bytes(audio[offset:offset + 1024])
-            await asyncio.sleep(0.001)
+            chunk = audio[offset:offset + 1024]
+            await websocket.send_bytes(chunk)
+            sent_seconds += len(chunk) / 2.0 / PIPER_SAMPLE_RATE
+            # Держим отправку около реального времени: ESP успевает играть,
+            # его кольцо не переполняется, i2s_write не блокирует loop().
+            target = max(0.0, sent_seconds - TTS_STREAM_LEAD) / TTS_STREAM_SPEED
+            lag = target - (time.time() - stream_started)
+            if lag > 0:
+                # Спим короткими порциями, чтобы не задерживать отмену/обрыв.
+                await asyncio.sleep(min(lag, 0.05))
 
     await websocket.send_text("END_OF_AUDIO")
     logging.info(
@@ -1059,26 +1160,31 @@ SYSTEM_PROMPT = (
     "отвечай коротко — одно-два предложения, не больше 150 символов. Без списков, "
     "markdown и канцелярита. Ты не управляешь устройствами и не выполняешь команды: "
     "если просят включить свет или телевизор, честно скажи, что теперь ты просто "
-    "собеседник. Если не знаешь — признайся, но не выдумывай."
+    "собеседник. Если не знаешь — признайся, но не выдумывай. "
+    "Ты помнишь текущий разговор в рамках одной сессии: опирайся на предыдущие "
+    "реплики, ссылайся на сказанное раньше, не переспрашивай то, что уже прозвучало."
 )
 
 LLM_FALLBACK = "Уточни, пожалуйста, а то я не разобрался, что сделать."
 
 
-def query_ollama_sync(user_text: str) -> str:
+def query_ollama_sync(
+    user_text: str, history: Optional[List[Dict[str, str]]] = None
+) -> str:
+    messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
     payload = {
         "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
-        ],
+        "messages": messages,
         "stream": False,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": 0.5,
             "top_p": 0.9,
-            "num_predict": 32,
-            "num_ctx": 512,
+            "num_predict": 48,
+            "num_ctx": OLLAMA_NUM_CTX,
             "repeat_penalty": 1.15,
         },
     }
@@ -1087,18 +1193,21 @@ def query_ollama_sync(user_text: str) -> str:
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=22) as response:
+    with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
         data = json.load(response)
     return str(data.get("message", {}).get("content", "")).strip()
 
 
-def query_deepseek_sync(user_text: str) -> str:
+def query_deepseek_sync(
+    user_text: str, history: Optional[List[Dict[str, str]]] = None
+) -> str:
+    messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
     payload = {
         "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
-        ],
+        "messages": messages,
         "stream": False,
         "temperature": 0.5,
         "max_tokens": 250,
@@ -1120,7 +1229,9 @@ def query_deepseek_sync(user_text: str) -> str:
     return str(choices[0].get("message", {}).get("content", "")).strip()
 
 
-def query_llm_sync(user_text: str) -> str:
+def query_llm_sync(
+    user_text: str, history: Optional[List[Dict[str, str]]] = None
+) -> str:
     """DeepSeek (если настроен) с автоматическим откатом на локальную Ollama."""
     global _DEEPSEEK_BLOCKED_UNTIL
 
@@ -1131,7 +1242,7 @@ def query_llm_sync(user_text: str) -> str:
     )
     if use_deepseek:
         try:
-            return query_deepseek_sync(user_text)
+            return query_deepseek_sync(user_text, history)
         except urllib.error.HTTPError as exc:
             # 402 — нет баланса, 401/403 — ключ/доступ. Не долбим API каждую минуту.
             pause = 600 if exc.code in (401, 402, 403) else 60
@@ -1147,7 +1258,7 @@ def query_llm_sync(user_text: str) -> str:
             if LLM_BACKEND == "deepseek":
                 raise
 
-    return query_ollama_sync(user_text)
+    return query_ollama_sync(user_text, history)
 
 
 def clean_llm_reply(reply: str) -> str:
@@ -1182,7 +1293,9 @@ def clean_llm_reply(reply: str) -> str:
     return reply
 
 
-async def query_llm(user_text: str) -> Dict[str, Any]:
+async def query_llm(
+    user_text: str, history: Optional[List[Dict[str, str]]] = None
+) -> Dict[str, Any]:
     loop = asyncio.get_running_loop()
     started = time.time()
 
@@ -1198,7 +1311,9 @@ async def query_llm(user_text: str) -> Dict[str, Any]:
             pass
 
     try:
-        raw_reply = await loop.run_in_executor(None, query_llm_sync, user_text)
+        raw_reply = await loop.run_in_executor(
+            None, query_llm_sync, user_text, history
+        )
     except Exception as exc:
         logging.error(f"[LLM] Бэкенд {LLM_BACKEND} недоступен: {exc}")
         raw_reply = "Не могу сейчас ответить. Попробуй ещё раз."
@@ -1215,22 +1330,32 @@ async def query_llm(user_text: str) -> Dict[str, Any]:
 
 
 def warmup_ollama() -> None:
+    """Грузит модель в память сразу с ТЕМ ЖЕ num_ctx, что и в бою.
+
+    Если прогреть с num_ctx=256, а потом запросить 4096, Ollama пересоздаёт
+    контекст и первый ответ идёт 16-36 секунд вместо 1-2. Поэтому греем
+    ровно теми параметрами, которые потом используются.
+    """
     try:
         payload = {
             "model": OLLAMA_MODEL,
             "messages": [{"role": "user", "content": "привет"}],
             "stream": False,
             "keep_alive": OLLAMA_KEEP_ALIVE,
-            "options": {"num_predict": 1, "num_ctx": 256},
+            "options": {"num_predict": 1, "num_ctx": OLLAMA_NUM_CTX},
         }
         request = urllib.request.Request(
             OLLAMA_URL,
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=60):
+        started = time.time()
+        with urllib.request.urlopen(request, timeout=120):
             pass
-        logging.info("[LLM] Модель прогрета и удерживается в памяти.")
+        logging.info(
+            f"[LLM] Модель прогрета за {time.time() - started:.1f} с и удерживается "
+            f"в памяти (num_ctx={OLLAMA_NUM_CTX})."
+        )
     except Exception as exc:
         logging.warning(f"[LLM] Прогрев не удался: {exc}")
 
@@ -1390,6 +1515,8 @@ async def health() -> Dict[str, Any]:
         "wake_word": "вегас",
         "mode": "conversational",
         "stt": "sherpa big-ru/en (conversational)",
+        "stt_prefer": STT_PREFER_LANGUAGE,
+        "memory": f"per-connection, {HISTORY_MAX_CHARS} chars",
         "llm": llm_info,
         "llm_backend": LLM_BACKEND,
         "tts": os.path.basename(PIPER_MODEL),
@@ -1414,6 +1541,49 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     speech_buffer = bytearray()
     wake_buffer = bytearray()
     wake_mode = False
+
+    # История диалога живёт только в рамках этого WebSocket-соединения.
+    # Пропало соединение (ESP уснул, Wi-Fi, ребут) — история обнуляется.
+    history: List[Dict[str, str]] = []
+
+    # Держим ESP бодрым, пока он на связи. Прошивка вызывает markActivity()
+    # на текст END_OF_AUDIO даже в состоянии idle, поэтому этот «пустой»
+    # маркер безопасно продлевает таймер сна. Шлём только когда не заняты
+    # обработкой реплики (иначе можно оборвать ответ).
+    busy = False
+
+    async def keepalive_loop() -> None:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            if busy:
+                continue
+            try:
+                await websocket.send_text("END_OF_AUDIO")
+                logging.debug("[Keepalive] продлил бодрствование ESP")
+            except Exception:
+                return
+
+    keepalive_task = asyncio.create_task(keepalive_loop())
+
+    def remember(role: str, content: str) -> None:
+        """Добавляет реплику в историю и подрезает её по символам."""
+        content = (content or "").strip()
+        if not content:
+            return
+        history.append({"role": role, "content": content})
+        total = sum(len(item["content"]) for item in history)
+        # Держим историю по бюджету символов, удаляя самые старые ПАРЫ
+        # (вопрос+ответ), чтобы история не начиналась с ответа без вопроса.
+        while len(history) > 2 and total > HISTORY_MAX_CHARS:
+            drop = 1 if history[0]["role"] == "assistant" else 2
+            drop = min(drop, len(history) - 1)
+            for _ in range(drop):
+                total -= len(history[0]["content"])
+                history.pop(0)
+        logging.info(
+            f"[История] реплик={len(history)}, символов={total}/"
+            f"{HISTORY_MAX_CHARS}"
+        )
 
     try:
         while True:
@@ -1468,6 +1638,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             speech_buffer.clear()
             logging.info(f"Получено {len(payload)} байт аудио.")
 
+            busy = True
             try:
                 raw_text, _mode, _info, _timings = await transcribe_audio(payload)
                 if not raw_text:
@@ -1516,10 +1687,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "source": "rules",
                     }
                 else:
-                    result = await query_llm(user_text)
+                    result = await query_llm(user_text, history)
 
                 reply_text = str(result.get("reply") or LLM_FALLBACK)
                 logging.info(f"Ответ ({result.get('source', '?')}): {reply_text}")
+
+                # Запоминаем обе стороны диалога: и вопрос, и ответ.
+                remember("user", user_text)
+                remember("assistant", reply_text)
 
                 await websocket.send_json(result)
                 await send_tts(websocket, reply_text)
@@ -1538,11 +1713,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_text("END_OF_AUDIO")
                 except Exception:
                     break
+            finally:
+                busy = False
 
     except WebSocketDisconnect:
-        logging.info(f"ESP32 отключен: {client_ip}")
+        pass
     except Exception as exc:
         logging.error(f"Ошибка WebSocket с {client_ip}: {exc}")
+    finally:
+        keepalive_task.cancel()
+        # Соединение закрыто (сон ESP, Wi-Fi, ребут, restart): память обнуляется.
+        # Это ровно то поведение, которое просил пользователь.
+        logging.info(
+            f"ESP32 отключен: {client_ip}, история диалога сброшена "
+            f"({len(history)} реплик)"
+        )
+        history.clear()
 
 
 @app.on_event("startup")

@@ -9,6 +9,12 @@
  *
  *   Сценарий: короткое/долгое нажатие BOOT -> писк -> запись -> отправка на сервер
  *   -> ответ Piper звучит через MAX98357A.
+ *
+ *   3.7.0: воспроизведение стало НЕБЛОКИРУЮЩИМ (кольцевой буфер + i2s_write
+ *   с таймаутом 0). Раньше i2s_write(portMAX_DELAY) вызывался прямо из
+ *   callback WebSocket и блокировал loop() на всю длину ответа — отсюда
+ *   перезагрузки во время/после длинных ответов. Плюс добавлен crash-лог
+ *   в RTC-память, который переживает перезагрузку.
  */
 
 #include <Arduino.h>
@@ -23,7 +29,7 @@
 #include "esp_sleep.h"
 #include "config.h"
 
-#define FW_VERSION "3.5.9"
+#define FW_VERSION "3.7.3"
 
 // ------------------------------------------------------------
 //  Константы и состояние
@@ -161,14 +167,65 @@ static uint32_t quietSince = 0;
 static bool quietActive = false;
 static float smoothRms = 0;
 static float noiseFloor = 0;
-static uint32_t noiseSum = 0;
-static uint32_t noiseCount = 0;
 static uint32_t lastRmsLog = 0;
 
 static bool audioDone = false;
 static uint32_t lastAudioAt = 0;
 static uint32_t thinkingSince = 0;
-static bool bootReady = false;
+
+// ------------------------------------------------------------
+//  Crash-лог в RTC-памяти (переживает перезагрузку)
+// ------------------------------------------------------------
+
+#define CRASH_MAGIC 0x56454741u // "VEGA"
+
+RTC_NOINIT_ATTR struct {
+    uint32_t magic;       // CRASH_MAGIC, если снимок валиден
+    uint32_t uptimeMs;    // сколько прожили к моменту снимка
+    uint32_t stateCode;   // в каком состоянии были
+    uint32_t heap;        // сколько heap оставалось
+    uint32_t slept;       // 1 = ушли в deep sleep штатно
+    char log[384];        // последние строки netLog
+} crashRec;
+
+static uint32_t prevResetReason = 0;
+static uint32_t prevUptimeMs = 0;
+static uint32_t prevStateCode = 0;
+static uint32_t prevHeap = 0;
+static String prevLog;
+
+static const char *resetReasonName(uint32_t reason) {
+    switch (reason) {
+        case 1: return "POWERON";
+        case 2: return "EXT_PIN";
+        case 3: return "SW";
+        case 4: return "PANIC";
+        case 5: return "INT_WDT";
+        case 6: return "TASK_WDT";
+        case 7: return "WDT";
+        case 8: return "DEEPSLEEP";
+        case 9: return "BROWNOUT";
+        case 10: return "SDIO";
+        case 11: return "SW_CPU0";
+        case 12: return "SW_CPU1";
+        default: return "?";
+    }
+}
+
+// Регулярно (раз в 5 с) сохраняем «снимок» состояния в RTC-память.
+// Если случится WDT/panic/brownout, после ребута в /status будет видно,
+// в каком состоянии и с каким heap устройство умерло.
+static void crashSaveSnapshot() {
+    crashRec.magic = CRASH_MAGIC;
+    crashRec.uptimeMs = millis();
+    crashRec.stateCode = (uint32_t)state;
+    crashRec.heap = (uint32_t)ESP.getFreeHeap();
+    int len = netLogBuf.length();
+    int take = len < (int)sizeof(crashRec.log) - 1 ? len : (int)sizeof(crashRec.log) - 1;
+    if (take < 0) take = 0;
+    memcpy(crashRec.log, netLogBuf.c_str() + (len - take), take);
+    crashRec.log[take] = 0;
+}
 
 // ------------------------------------------------------------
 //  Буферы
@@ -187,6 +244,40 @@ static int32_t dcOffsetL = 0;
 static int32_t dcOffsetR = 0;
 static int lastRmsL = 0;
 static int lastRmsR = 0;
+
+// ------------------------------------------------------------
+//  Кольцевой буфер динамика (неблокирующее воспроизведение)
+//  16384 сэмплов ≈ 0.74 с при 22.05 кГц. Сервер шлёт аудио в темпе
+//  реального времени, поэтому кольцо гасит дрожание сети, а не копит
+//  «на будущее» — callback WebSocket не блокирует loop().
+// ------------------------------------------------------------
+
+static const int SPK_RING_SAMPLES = 16384;
+static int16_t spkRing[SPK_RING_SAMPLES];
+static int spkHead = 0;   // индекс записи
+static int spkTail = 0;   // индекс чтения
+static int spkCount = 0;  // сколько сэмплов ждёт отправки
+static uint32_t spkDrainAt = 0;     // когда кольцо опустело (для хвоста DMA)
+static uint32_t spkProgressAt = 0;  // последний успешный прогресс записи
+
+static int spkFree() { return SPK_RING_SAMPLES - spkCount; }
+
+static bool spkAppend(const int16_t *data, size_t frames) {
+    if ((int)frames > spkFree()) return false;
+    for (size_t i = 0; i < frames; ++i) {
+        spkRing[spkHead] = data[i];
+        spkHead = (spkHead + 1) % SPK_RING_SAMPLES;
+    }
+    spkCount += (int)frames;
+    return true;
+}
+
+static void spkReset() {
+    spkHead = 0;
+    spkTail = 0;
+    spkCount = 0;
+    spkDrainAt = 0;
+}
 
 // Butterworth high-pass 100 Гц, 2-й порядок, fs=16 кГц.
 // Убирает постоянку и наводку 50 Гц, речь выше 200 Гц не трогает.
@@ -329,26 +420,57 @@ static void initSpeaker() {
 }
 
 // Моно PCM -> стерео (драйвер ESP32-I2S работает в RIGHT_LEFT).
-static void writeMonoPcm(const int16_t *data, size_t frames) {
-    while (frames > 0) {
-        size_t n = frames > 256 ? 256 : frames;
-        for (size_t i = 0; i < n; ++i) {
-            stereoBuf[2 * i]     = data[i];
-            stereoBuf[2 * i + 1] = data[i];
-        }
-        size_t written = 0;
-        i2s_write(I2S_SPK_PORT, stereoBuf, n * 2 * sizeof(int16_t),
-                  &written, portMAX_DELAY);
-        data += n;
-        frames -= n;
-        ledUpdate(); // не даём LED «замереть» во время длинного ответа
+// ВАЖНО: не блокируется. Если DMA занят — возвращает false, вызывающий
+// код подождёт в loop() и вызовет снова. Так loop() никогда не встаёт
+// намертво и watchdog не срабатывает.
+// Пишет максимум n кадров. Возвращает число РЕАЛЬНО принятых кадров
+// (может быть меньше n: i2s_write с таймаутом 0 отдаёт столько, сколько
+// влезло в DMA). Никогда не блокирует — именно поэтому loop() жив.
+static int writeMonoPcmCount(const int16_t *data, int frames, TickType_t wait) {
+    if (frames <= 0) return 0;
+    int n = frames > 256 ? 256 : frames;
+    for (int i = 0; i < n; ++i) {
+        stereoBuf[2 * i]     = data[i];
+        stereoBuf[2 * i + 1] = data[i];
     }
+    size_t written = 0;
+    esp_err_t err = i2s_write(I2S_SPK_PORT, stereoBuf, (size_t)n * 2 * sizeof(int16_t),
+                              &written, wait);
+    if (err != ESP_OK) return 0;
+    return (int)(written / (2 * sizeof(int16_t)));
+}
+
+// Отправляет из кольца столько, сколько принимает DMA. Не блокирует.
+static void spkPump() {
+    while (spkCount > 0) {
+        int want = spkCount > 256 ? 256 : spkCount;
+        // Читаем, НЕ сдвигая хвост: сдвиг только на реально записанное.
+        int16_t chunk[256];
+        for (int i = 0; i < want; ++i) {
+            chunk[i] = spkRing[(spkTail + i) % SPK_RING_SAMPLES];
+        }
+        int sent = writeMonoPcmCount(chunk, want, 0);
+        if (sent <= 0) {
+            // DMA полон — выходим, loop() вернётся сюда в следующей итерации.
+            return;
+        }
+        spkTail = (spkTail + sent) % SPK_RING_SAMPLES;
+        spkCount -= sent;
+        spkProgressAt = millis();
+        if (sent < want) {
+            // Частичная запись: DMA почти полон, дальше ждать смысла нет.
+            return;
+        }
+    }
+    if (spkDrainAt == 0) spkDrainAt = millis();
 }
 
 static void playTone(uint16_t freq, uint16_t ms) {
     const int total = (SPK_SAMPLE_RATE * ms) / 1000;
     int16_t mono[256];
 
+    // Тон короткий (до нескольких сотен мс), поэтому здесь допустимо
+    // подождать: пишем порциями с таймаутом и не забываем кормить loop.
     for (int done = 0; done < total; ) {
         int n = total - done;
         if (n > 256) n = 256;
@@ -356,7 +478,18 @@ static void playTone(uint16_t freq, uint16_t ms) {
             float t = (float)(done + i) / (float)SPK_SAMPLE_RATE;
             mono[i] = (int16_t)(sinf(2.0f * PI * freq * t) * 6000.0f);
         }
-        writeMonoPcm(mono, n);
+        int left = n;
+        int off = 0;
+        uint32_t t0 = millis();
+        while (left > 0 && millis() - t0 < 2000) {
+            int sent = writeMonoPcmCount(mono + off, left, pdMS_TO_TICKS(50));
+            if (sent <= 0) {
+                delay(2);
+                continue;
+            }
+            off += sent;
+            left -= sent;
+        }
         done += n;
     }
 }
@@ -465,7 +598,7 @@ static void setState(State s) {
 }
 
 static void cleanupAfterConversation() {
-    // Освобождаем память после каждого разговора
+    // Освобождаем память/состояние после каждого разговора.
     netLogBuf = "";
     netLogBuf.reserve(0);
     cmdPrerollCount = 0;
@@ -483,6 +616,7 @@ static void enterIdle(const char *reason) {
     if (state == ST_SPEAKING || state == ST_THINKING) {
         i2s_zero_dma_buffer(I2S_SPK_PORT);
         audioDone = false;
+        spkReset();
     }
     followUpMode = false;
     setState(ST_IDLE);
@@ -493,6 +627,7 @@ static void enterIdle(const char *reason) {
 static void stopSpeakingNow() {
     markActivity();
     i2s_zero_dma_buffer(I2S_SPK_PORT);
+    spkReset();
     enterIdle("tts stop");
 }
 
@@ -505,6 +640,8 @@ static void goToSleep() {
     Serial.printf("[Сон] Deep sleep: idle=%lu с, uptime=%lu с, wake: BOOT/GPIO0.\n",
                   (unsigned long)((millis() - lastActivityAt) / 1000),
                   (unsigned long)(millis() / 1000));
+    // Помечаем штатный сон, чтобы следующий запуск не считал его падением.
+    crashRec.slept = 1;
     ledSet(0, 0, 0); // выключаем RGB перед сном
     if (statusServerStarted) {
         statusServer.stop();
@@ -579,8 +716,6 @@ static void startListening() {
     quietSince = 0;
     quietActive = false;
     smoothRms = 0;
-    noiseSum = 0;
-    noiseCount = 0;
 
     recordStart = millis();
     speechStartAt = 0;
@@ -611,8 +746,6 @@ static void startFollowUpListening() {
     quietSince = 0;
     quietActive = false;
     smoothRms = 0.0f;
-    noiseSum = 0;
-    noiseCount = 0;
     speechStartAt = 0;
 
     recordStart = millis();
@@ -703,7 +836,7 @@ static void recordStep() {
         // Порог тишины — от измеренного фона, а не жёсткие 300 RMS.
         uint32_t silenceThr = (uint32_t)fmaxf((float)VAD_SILENCE_RMS,
                                               noiseFloor * 1.25f);
-        float fastThr = fmaxf(80.0f, noiseFloor * 1.05f);
+        float fastThr = fmaxf((float)VAD_SILENCE_FAST_RMS, noiseFloor * 1.05f);
 
         if (smoothRms >= (float)silenceThr) {
             lastVoiceAt = now;
@@ -775,11 +908,17 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
             text[n] = '\0';
 
             if (strcmp(text, "END_OF_AUDIO") == 0) {
-                markActivity();
+                // Сервер периодически присылает END_OF_AUDIO как keepalive.
+                // В IDLE не считаем это активностью пользователя, иначе сон
+                // никогда не наступит при активном WS-соединении.
+                if (state != ST_IDLE && !otaInProgress) markActivity();
                 if (state == ST_SPEAKING) {
+                    // Аудио принято, но в кольце может быть ещё не проиграно.
+                    // Не ставим audioDone сразу: loop() доиграет остаток.
                     audioDone = true;
                     lastAudioAt = millis();
-                    netLog("[Ответ] Конец аудио.\n");
+                    netLog("[Ответ] Конец аудио, в кольце %d сэмплов.\n",
+                           spkCount);
                 } else if (state == ST_THINKING) {
                     Serial.println("[Ответ] Аудио нет, ответ только текстом.");
                     startFollowUpListening();
@@ -815,6 +954,8 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
                 markActivity();
                 i2s_set_sample_rates(I2S_SPK_PORT, SPK_SAMPLE_RATE);
                 audioDone = false;
+                spkReset();
+                spkProgressAt = millis();
                 setState(ST_SPEAKING);
                 Serial.printf("[Ответ] Начало аудио (%u байт)...\n",
                               (unsigned)length);
@@ -823,11 +964,27 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
                 if (length & 1) length--;
                 size_t samples = length / 2;
                 const int16_t *src = (const int16_t *)payload;
+                // Кольцо может заполниться: сервер шлёт быстрее реального
+                // времени. Тогда ждём в коротком цикле, но ОБЯЗАТЕЛЬНО
+                // возвращаем управление в loop() (через delay(1)), иначе
+                // watchdog снова прибьёт устройство во время длинного ответа.
+                uint32_t stallSince = millis();
                 while (samples > 0) {
                     size_t chunk = samples > 256 ? 256 : samples;
-                    writeMonoPcm(src, chunk);
-                    src += chunk;
-                    samples -= chunk;
+                    if (spkAppend(src, chunk)) {
+                        src += chunk;
+                        samples -= chunk;
+                        continue;
+                    }
+                    spkPump();
+                    if (millis() - stallSince > 2000) {
+                        // 2 секунды без прогресса — DMA встал. Не висим.
+                        netLog("[Динамик] DMA не принимает 2 с, сброс.\n");
+                        i2s_zero_dma_buffer(I2S_SPK_PORT);
+                        spkReset();
+                        stallSince = millis();
+                    }
+                    delay(1);
                 }
                 lastAudioAt = millis();
                 markActivity();
@@ -963,7 +1120,16 @@ static void handleStatus() {
     doc["boot_just_woke"] = bootJustWoke;
     doc["ota_started"] = otaStarted;
     doc["ota_in_progress"] = otaInProgress;
-    doc["reset_reason"] = (int)esp_reset_reason();
+    // reset_reason — почему закончилась ПРОШЛАЯ жизнь.
+    doc["reset_reason"] = (int)prevResetReason;
+    doc["reset_reason_name"] = resetReasonName(prevResetReason);
+    doc["prev_uptime_ms"] = prevUptimeMs;
+    doc["prev_state"] = stateName((State)prevStateCode);
+    doc["prev_heap"] = prevHeap;
+    doc["prev_log"] = prevLog;
+    // Кольцо динамика: видно, если звук «залип».
+    doc["spk_ring"] = spkCount;
+    doc["spk_free"] = spkFree();
     doc["wake_cause"] = (int)esp_sleep_get_wakeup_cause();
     doc["ip"] = WiFi.localIP().toString();
 
@@ -1024,8 +1190,41 @@ void setup() {
     delay(300);
 
     Serial.println("\n=== ESP32-S3: голосовой ассистент «Вегас» ===");
-    Serial.printf("[BOOT] fw=%s, reset_reason=%d, wake_cause=%d\n",
-                  FW_VERSION, (int)esp_reset_reason(),
+
+    // Причина текущего сброса = то, КАК закончилась прошлая жизнь.
+    prevResetReason = esp_reset_reason();
+    // Снимок состояния, сделанный за мгновение до падения (раз в 5 с).
+    if (crashRec.magic == CRASH_MAGIC) {
+        prevUptimeMs = crashRec.uptimeMs;
+        prevStateCode = crashRec.stateCode;
+        prevHeap = crashRec.heap;
+        prevLog = String(crashRec.log);
+        if (prevResetReason != 8 /* DEEPSLEEP */) {
+            Serial.printf("[CRASH] сброс %s (%lu) после uptime=%lu мс, "
+                          "state=%lu, heap=%lu\n",
+                          resetReasonName(prevResetReason),
+                          (unsigned long)prevResetReason,
+                          (unsigned long)prevUptimeMs,
+                          (unsigned long)prevStateCode,
+                          (unsigned long)prevHeap);
+            if (prevLog.length()) {
+                Serial.printf("[CRASH] последний лог:\n%s\n", prevLog.c_str());
+            }
+        }
+        if (crashRec.slept) {
+            Serial.println("[CRASH] предыдущий выход был штатным deep sleep.");
+        }
+    }
+    crashRec.magic = 0;
+    crashRec.uptimeMs = 0;
+    crashRec.stateCode = 0;
+    crashRec.heap = 0;
+    crashRec.slept = 0;
+    crashRec.log[0] = 0;
+
+    Serial.printf("[BOOT] fw=%s, reset_reason=%d (%s), wake_cause=%d\n",
+                  FW_VERSION, (int)prevResetReason,
+                  resetReasonName(prevResetReason),
                   (int)esp_sleep_get_wakeup_cause());
     Serial.printf("Сервер: %s:%d%s\n", SERVER_HOST, SERVER_PORT, SERVER_PATH);
     Serial.println("Динамик: BCLK=15, LRC=16, DIN=17; микрофон: SCK=4, WS=5, SD=6");
@@ -1104,6 +1303,14 @@ void loop() {
     if (otaStarted) ArduinoOTA.handle();
     if (statusServerStarted) statusServer.handleClient();
 
+    // Снимок состояния в RTC раз в 5 с: если сейчас watchdog/panic/броунаут,
+    // после перезагрузки /status покажет, где именно мы были и сколько heap.
+    static uint32_t lastSnapshotAt = 0;
+    if (millis() - lastSnapshotAt >= 5000) {
+        lastSnapshotAt = millis();
+        crashSaveSnapshot();
+    }
+
     // Диагностика: RSSI, WebSocket, heap, uptime — раз в 10 секунд.
     static uint32_t lastDiagAt = 0;
     if (millis() - lastDiagAt >= 10000) {
@@ -1171,7 +1378,9 @@ void loop() {
             break;
 
         case ST_SPEAKING:
-            if (audioDone && millis() - lastAudioAt > 500) {
+            // Сначала досылаем кольцо в DMA, потом уже решаем, что ответ кончился.
+            spkPump();
+            if (audioDone && spkCount == 0 && millis() - lastAudioAt > 500) {
                 audioDone = false;
                 startFollowUpListening();
             }
